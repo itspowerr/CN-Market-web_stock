@@ -52,6 +52,9 @@ versions/
 stock-website/node_modules/
 stock-website/dist/
 
+# Frontend dev/mock server
+stock-website/mock-server.mjs
+
 # LaTeX build artifacts
 *.aux
 *.log
