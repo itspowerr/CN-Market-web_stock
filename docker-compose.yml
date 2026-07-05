@@ -1,0 +1,19 @@
+services:
+  mc-server:
+    image: itzg/minecraft-server
+    container_name: market-dev-server
+    ports:
+      - "25565:25565"
+    environment:
+      EULA: "TRUE"
+      TYPE: "PAPER"
+      VERSION: "26.1.2"
+      MEMORY: "2G"
+      UID: 1000
+      GID: 1000
+    volumes:
+      # Mount the built plugin JAR to the plugins folder
+      # Note: You need to run 'mvn package' first to generate the JAR in target/
+      - ./target/Market.jar:/data/plugins/Market.jar:ro
+      - ./mc-data:/data
+    restart: unless-stopped

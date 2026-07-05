@@ -1,0 +1,187 @@
+package net.craftnepal.market.Listeners;
+
+import net.craftnepal.market.utils.MarketUtils;
+import net.craftnepal.market.managers.DatabaseManager;
+import org.bukkit.Bukkit;
+import org.bukkit.Location;
+import org.bukkit.Material;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.inventory.ItemStack;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+
+public class RegionSelection implements Listener {
+    private static final Map<UUID, String> selectionModePlayers = new ConcurrentHashMap<>();
+    private static final Map<UUID, Location> playerSelections = new ConcurrentHashMap<>();
+    private static final Map<UUID, Long> selectionCooldowns = new ConcurrentHashMap<>();
+
+    private static final long SELECTION_COOLDOWN_MS = 1000;
+    private static final Material SELECTION_TOOL = Material.STICK;
+
+    public enum SelectionMode {
+        MARKET_PLOT
+    }
+
+    @EventHandler
+    public void onRegionSelection(PlayerInteractEvent event) {
+        Player player = event.getPlayer();
+        UUID uuid = player.getUniqueId();
+
+        if (!isPlayerInSelectionMode(uuid) || !isHoldingSelectionTool(player)) {
+            return;
+        }
+
+        if (!event.getAction().name().contains("RIGHT_CLICK") || event.getClickedBlock() == null) {
+            player.sendMessage("Cannot find block!");
+            return;
+        }
+
+        if (isOnCooldown(uuid)) {
+            return;
+        }
+
+        handleSelection(player, event.getClickedBlock().getLocation());
+        selectionCooldowns.put(uuid, System.currentTimeMillis());
+    }
+
+    private boolean isPlayerInSelectionMode(UUID uuid) {
+        return selectionModePlayers.containsKey(uuid);
+    }
+
+    private boolean isHoldingSelectionTool(Player player) {
+        ItemStack item = player.getInventory().getItemInMainHand();
+        return item.getType() == SELECTION_TOOL;
+    }
+
+    private boolean isOnCooldown(UUID uuid) {
+        long currentTime = System.currentTimeMillis();
+        Long lastSelectionTime = selectionCooldowns.get(uuid);
+        return lastSelectionTime != null && currentTime - lastSelectionTime < SELECTION_COOLDOWN_MS;
+    }
+
+    private void handleSelection(Player player, Location clickedLocation) {
+        UUID uuid = player.getUniqueId();
+        
+        // Ensure manual selection only happens in the market world
+        if (!MarketUtils.isInMarketArea(clickedLocation)) {
+            player.sendMessage("§cManual selection can only be done in the market world!");
+            cleanupSelection(uuid);
+            return;
+        }
+
+        if (!playerSelections.containsKey(uuid)) {
+            // First selection point
+            playerSelections.put(uuid, clickedLocation);
+            player.sendMessage("Position 1 selected! Please select another location.");
+            return;
+        }
+
+        // Second selection point - complete the region
+        Location point1 = playerSelections.get(uuid);
+        Location point2 = clickedLocation;
+
+        RegionBounds bounds = new RegionBounds(point1, point2);
+        saveMarketPlot(bounds, player);
+        cleanupSelection(uuid);
+    }
+
+    private void saveMarketPlot(RegionBounds bounds, Player player) {
+        List<String> plotIds = DatabaseManager.getAllPlotIds();
+        
+        // Generate a unique ID for the manual plot
+        String newPlotId = "manual_" + System.currentTimeMillis();
+
+        // Check for overlaps
+        for (String plotId : plotIds) {
+            RegionBounds existingPlot = getPlotBounds(plotId);
+            if (existingPlot.getMin() != null && bounds.intersects(existingPlot)) {
+                player.sendMessage("Error: The selected area overlaps with existing plot " + plotId);
+                return;
+            }
+        }
+
+        // Save the new plot to SQLite
+        DatabaseManager.savePlot(newPlotId, null, bounds.getMin(), bounds.getMax(), null);
+
+        player.sendMessage("Created new manual plot: " + newPlotId);
+    }
+
+    private RegionBounds getPlotBounds(String plotId) {
+        Location min = DatabaseManager.getPlotPosMin(plotId);
+        Location max = DatabaseManager.getPlotPosMax(plotId);
+        return new RegionBounds(min, max);
+    }
+
+    private void cleanupSelection(UUID uuid) {
+        selectionModePlayers.remove(uuid);
+        playerSelections.remove(uuid);
+    }
+
+    // Helper class to handle region bounds operations
+    private static class RegionBounds {
+        private final Location min;
+        private final Location max;
+
+        public RegionBounds(Location point1, Location point2) {
+            this.min = new Location(
+                    point1.getWorld(),
+                    Math.min(point1.getX(), point2.getX()),
+                    Math.min(point1.getY(), point2.getY()),
+                    Math.min(point1.getZ(), point2.getZ())
+            );
+            this.max = new Location(
+                    point1.getWorld(),
+                    Math.max(point1.getX(), point2.getX()),
+                    Math.max(point1.getY(), point2.getY()),
+                    Math.max(point1.getZ(), point2.getZ())
+            );
+        }
+
+        public Location getMin() {
+            return min;
+        }
+
+        public Location getMax() {
+            return max;
+        }
+
+        public boolean intersects(RegionBounds other) {
+            if (min == null || max == null || other.min == null || other.max == null) {
+                return false;
+            }
+            return (min.getX() <= other.max.getX() && max.getX() >= other.min.getX()) &&
+                    (min.getY() <= other.max.getY() && max.getY() >= other.min.getY()) &&
+                    (min.getZ() <= other.max.getZ() && max.getZ() >= other.min.getZ());
+        }
+
+        public boolean contains(RegionBounds other) {
+            if (min == null || max == null || other.min == null || other.max == null) {
+                return false;
+            }
+            return min.getX() <= other.min.getX() && max.getX() >= other.max.getX() &&
+                    min.getY() <= other.min.getY() && max.getY() >= other.max.getY() &&
+                    min.getZ() <= other.min.getZ() && max.getZ() >= other.max.getZ();
+        }
+    }
+
+    // Static utility methods
+    public static void addSelectionModePlayer(UUID uuid, SelectionMode mode) {
+        selectionModePlayers.put(uuid, mode.name());
+    }
+
+    public static void removeSelectionModePlayer(UUID uuid) {
+        selectionModePlayers.remove(uuid);
+        playerSelections.remove(uuid);
+    }
+
+    public static boolean isInSelectionMode(UUID uuid) {
+        return selectionModePlayers.containsKey(uuid);
+    }
+}

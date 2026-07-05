@@ -1,0 +1,1108 @@
+\documentclass[12pt,a4paper]{report}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{color}
+\usepackage{graphicx}
+\usepackage{longtable}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{array}
+
+% ── Color definitions ──
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+\definecolor{javadoc}{rgb}{0.25,0.35,0.55}
+
+% ── Code style ──
+\lstdefinestyle{mystyle}{
+    backgroundcolor=\color{backcolour},
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{magenta},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\small,
+    breakatwhitespace=false,
+    breaklines=true,
+    captionpos=b,
+    keepspaces=true,
+    numbers=left,
+    numbersep=5pt,
+    showspaces=false,
+    showstringspaces=false,
+    showtabs=false,
+    tabsize=4,
+    frame=single,
+    rulecolor=\color{codegray},
+    xleftmargin=2em,
+    framexleftmargin=1.5em,
+}
+\lstset{style=mystyle}
+
+% ── Java language definition improvements ──
+\lstdefinelanguage{JavaImproved}{
+    language=Java,
+    morekeywords={@Override,@SuppressWarnings},
+    sensitive=true,
+}
+
+\title{\textbf{CN-Market Stock Market Plugin}\\[0.5em]
+\large Technical Documentation \& Developer Guide}
+\author{CraftNepal Development Team}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+% ── Helper for breaking paths in tables ──
+\newcommand{\apipath}[1]{\path{#1}}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\chapter{Introduction}
+% ══════════════════════════════════════════════════════════════════════════════
+
+The CN-Market plugin is a Spigot/Paper 1.21.x Minecraft server plugin that
+provides a persistent market world with player-owned shops, admin shops,
+currency exchange, and---since version 1.1.4---a full real-time stock market
+system with web-based trading.
+
+This document covers the stock market subsystem: its architecture,
+authentication model, REST and WebSocket APIs, order matching engine,
+candle aggregation, and the companion React frontend.
+
+The stock market allows players to trade virtual ``shares'' backed by
+in-game item tickers (e.g.\ DIAMOND, IRON\_INGOT). All trades settle
+against the player's Vault economy balance in real time. No physical items
+move; the system is a pure speculation layer on top of the existing shop
+economy.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\chapter{System Architecture}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\section{Component Overview}
+
+The stock market system consists of the following components:
+
+\begin{description}
+\item[StockMarketEngine] Core singleton that maintains the in-memory order book,
+  executes trades, manages portfolios, and persists all state to SQLite.
+\item[EmbeddedServer] JDK \texttt{com.sun.net.httpserver.HttpServer} running on a
+  configurable port (default 8080). Serves REST JSON endpoints for
+  authentication, market data, and trading.
+\item[WebSocketManager] Separate server (default port 8081) that implements the
+  RFC~6455 WebSocket protocol. Broadcasts real-time ticker snapshots, trade
+  executions, and order book updates.
+\item[ApiKeyManager] Handles API key generation (PBKDF2WithHmacSHA256, 120k
+  iterations), session tokens, TOTP setup, lockout logic, and backup code
+  verification.
+\item[TwoFactorAuth] RFC~6238 TOTP implementation using HMAC-SHA1 and
+  Base32-encoded secrets.
+\item[CandleAggregator] Background task that builds OHLCV candlestick data
+  from the trade history at five interval granularities.
+\item[RateLimiter] Sliding-window rate limiter applied to all REST and
+  WebSocket traffic.
+\item[transform.ts] Shared TypeScript utility that normalizes all
+  snake\_case API and WebSocket responses to camelCase,
+  providing a consistent interface to all frontend components.
+\end{description}
+
+\section{Data Flow}
+
+\begin{enumerate}
+\item A player generates an API key in-game: \texttt{/market apikey generate}.
+  The plaintext key is shown once, its PBKDF2 hash is stored in SQLite.
+ \item The player visits the web frontend and enters the API key on the login page.
+\item The frontend calls \texttt{POST /api/v1/auth/step1} with the key. The
+  server resolves the key to a UUID, checks expiration and lockout status,
+  and returns the UUID plus TOTP setup data if first-time setup is needed.
+\item The frontend calls \texttt{POST /api/v1/auth/step2} with the UUID
+  and a TOTP code from the player's authenticator app. On success, a session
+  cookie (\texttt{market\_session}) is set and a session token is returned.
+\item All subsequent API calls carry the session cookie via
+  \texttt{credentials: 'include'}. The server resolves the session to a UUID
+  and executes the requested operation (place order, cancel order, query
+  portfolio, etc.).
+\item All API and WebSocket responses use snake\_case field names. The
+  frontend's \texttt{transformKeys()} utility normalizes them to camelCase
+  before they reach React components.
+\item When a trade executes, \texttt{StockMarketEngine} calls
+  \texttt{broadcastTrades()}, which pushes the trade event to
+  \texttt{WebSocketManager}. The WebSocket server broadcasts to all
+  subscribed clients.
+\item A separate tick loop runs every 60 seconds: evaluate stop-loss and
+  take-profit orders, aggregate OHLCV candles, clean up old data.
+\end{enumerate}
+
+\section{Database Schema}
+
+All persistent state lives in a single SQLite file at
+\texttt{plugins/Market/market.db}. The stock-market tables are:
+
+\begin{tabular}{>{\raggedright\arraybackslash}p{3cm}>{\raggedright\arraybackslash}p{4.5cm}>{\raggedright\arraybackslash}p{7.5cm}}
+\toprule
+\textbf{Table} & \textbf{Purpose} & \textbf{Key Columns} \\
+\midrule
+\texttt{api\_keys} & API key hashes, TOTP, sessions & uuid, key\_hash, totp\_secret, session\_token \\
+\texttt{stock\_orders} & All orders (open/filled/cancelled) & id, ticker, type, side, price, quantity, status \\
+\texttt{stock\_trades} & Executed trade log & id, ticker, price, quantity, buyer, seller, timestamp \\
+\texttt{stock\_portfolios} & Player share holdings & uuid, ticker, shares, avg\_entry\_price \\
+\texttt{stock\_candles} & OHLCV aggregated candles & ticker, interval, open\_time, o/h/l/c, volume \\
+\bottomrule
+\end{tabular}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\chapter{Stock Market Engine}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\section{File Location}
+
+All stock market engine code resides in:
+\begin{quote}
+\texttt{src/main/java/net/craftnepal/market/stock/}
+\end{quote}
+
+The main engine is \texttt{StockMarketEngine.java} (\textasciitilde990 lines).
+
+\section{Order Types}
+
+The engine supports four order types, defined in the \texttt{OrderType} enum
+at line~24:
+
+\begin{lstlisting}[language=Java, caption=Order types (StockMarketEngine.java:24)]
+public enum OrderType {
+    MARKET, LIMIT, STOP_LOSS, TAKE_PROFIT
+}
+\end{lstlisting}
+
+\begin{description}
+\item[MARKET] Executes immediately against the best available opposite orders
+  in the book. No price limit is required.
+\item[LIMIT] Executes only at the specified price or better. If not fully
+  filled, the remainder sits in the order book.
+\item[STOP\_LOSS] A sell order that sits in the book until the market price
+  drops to or below the stop price. When triggered, it converts to a MARKET
+  sell and executes immediately.
+\item[TAKE\_PROFIT] A sell order that sits in the book until the market price
+  rises to or above the target price. When triggered, it converts to a MARKET
+  sell.
+\end{description}
+
+Price clamping is enforced for LIMIT orders at lines~224--229:
+
+\begin{lstlisting}[language=Java, caption=Price clamping (StockMarketEngine.java:224-229)]
+if (type == OrderType.LIMIT && price > 0) {
+    double maxAllowed = referencePrice * 1.20;
+    double minAllowed = referencePrice * 0.80;
+    if (price > maxAllowed) price = maxAllowed;
+    if (price < minAllowed) price = minAllowed;
+}
+\end{lstlisting}
+
+\section{Order Matching Algorithm}
+
+The engine uses an in-memory order book implemented with
+\texttt{ConcurrentHashMap<String, NavigableMap<Double, List<Order>>>}
+(lines~126--127):
+
+\begin{lstlisting}[language=Java, caption=Order book data structures (StockMarketEngine.java:126-127)]
+private static final ConcurrentHashMap<String, NavigableMap<Double, List<Order>>>
+    bidsByTicker = new ConcurrentHashMap<>();
+private static final ConcurrentHashMap<String, NavigableMap<Double, List<Order>>>
+    asksByTicker = new ConcurrentHashMap<>();
+\end{lstlisting}
+
+Bids are stored in descending order (highest bid first), asks in ascending
+order (lowest ask first). The matching logic for a buy market order
+(\texttt{matchBuyMarket}, line~325) iterates ask levels from low to high,
+matching as much quantity as possible at each price level. For limit orders
+(\texttt{matchBid}, line~428), matching stops when the ask price exceeds the
+bid price.
+
+\subsection{Price Discovery}
+
+When a trade executes, the trade price is recorded as the last price for that
+ticker (line~514):
+
+\begin{lstlisting}[language=Java, caption=Last price update (StockMarketEngine.java:513-514)]
+// Update last price
+lastPrices.put(buyOrder.ticker, tradePrice);
+\end{lstlisting}
+
+If no trades exist for a ticker, the engine falls back to
+\texttt{DynamicPriceManager.getDynamicPrice()} which provides a fundamental
+value based on the item's shop price history.
+
+\section{Stop-Order Evaluation}
+
+The \texttt{evaluateStopOrders()} method (line~777) runs on a 60-second async
+timer from \texttt{Market.java}. It queries all OPEN stop-loss and
+take-profit orders from the database, checks the current market price against
+each order's stop price, and triggers matching orders as MARKET orders:
+
+\begin{lstlisting}[language=Java, caption=Stop-order trigger logic (StockMarketEngine.java:795-803)]
+boolean shouldTrigger = false;
+if (order.type == OrderType.STOP_LOSS) {
+    if (order.side == OrderSide.SELL && currentPrice <= order.stopPrice) {
+        shouldTrigger = true;
+    }
+} else if (order.type == OrderType.TAKE_PROFIT) {
+    if (order.side == OrderSide.SELL && currentPrice >= order.stopPrice) {
+        shouldTrigger = true;
+    }
+}
+\end{lstlisting}
+
+\section{Portfolio Management}
+
+Player share holdings are tracked in two maps (lines~128--129):
+
+\begin{lstlisting}[language=Java, caption=Portfolio state (StockMarketEngine.java:128-129)]
+private static final ConcurrentHashMap<String, HashMap<String, Integer>>
+    playerShares = new ConcurrentHashMap<>();
+private static final ConcurrentHashMap<String, HashMap<String, Double>>
+    playerAvgPrice = new ConcurrentHashMap<>();
+\end{lstlisting}
+
+The \texttt{getPortfolio()} method (line~621) computes per-holding P\&L and
+returns a structured map with total value, cost, and percentage returns.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\chapter{Authentication System}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\section{API Key Lifecycle}
+
+\subsection{Generation}
+
+Keys are generated by \texttt{ApiKeyManager.generateKey()}:
+
+\begin{lstlisting}[language=Java, caption=API key generation (ApiKeyManager.java)]
+public static String[] generateKey(String uuid) {
+    byte[] keyBytes = new byte[32];
+    RANDOM.nextBytes(keyBytes);
+    StringBuilder key = new StringBuilder("mk_");
+    for (byte b : keyBytes) key.append(String.format("%02x", b & 0xff));
+    String plainKey = key.toString();
+    String hash = hashKey(plainKey);
+    // store hash in DB, return plaintext key
+}
+\end{lstlisting}
+
+The plaintext key (format: \texttt{mk\_} followed by 64 hex characters) is
+displayed to the player exactly once via the in-game command and is never
+persisted. The hash uses PBKDF2WithHmacSHA256 with 120,000 iterations.
+
+\subsection{Expiration and Renewal}
+
+Keys expire after 7 days. The player can renew via
+\texttt{/market apikey renew} before expiration. Expired keys return 401
+from the API.
+
+\subsection{Revocation}
+
+\texttt{/market apikey revoke} immediately deletes the key hash from the
+database, invalidating all active sessions.
+
+\section{Two-Factor Authentication (TOTP)}
+
+When a player first authenticates through the website, the server checks
+whether TOTP has been set up. If not, it generates a secret and returns a
+provisioning URL for the authenticator app:
+
+\begin{lstlisting}[language=Java, caption=TOTP setup response (EmbeddedServer.java:127-135)]
+if (!data.totpEnabled) {
+    String totpSecret = TwoFactorAuth.generateSecret();
+    String[] backupCodes = TwoFactorAuth.generateBackupCodes();
+    String qrUrl = TwoFactorAuth.getQRCodeURL(getPlayerName(uuid), totpSecret);
+    resp.put("totp_setup_needed", true);
+    resp.put("totp_secret", totpSecret);
+    resp.put("qr_code_url", qrUrl);
+    resp.put("backup_codes", String.join(", ", backupCodes));
+    ApiKeyManager.setupTOTP(uuid, totpSecret, backupCodes);
+}
+\end{lstlisting}
+
+The TOTP implementation follows RFC~6238 using HMAC-SHA1 and 30-second
+time steps. Backup codes are hashed with the same PBKDF2 function and stored
+as a JSON array in the \texttt{backup\_codes} column.
+
+\section{Session Management}
+
+After step~2, a session token is created (line~178):
+
+\begin{lstlisting}[language=Java, caption=Session creation (EmbeddedServer.java:178-183)]
+String sessionToken = ApiKeyManager.createSession(uuid);
+Map<String, Object> resp = new HashMap<>();
+resp.put("session_token", sessionToken);
+resp.put("expires_at", System.currentTimeMillis() + (24L * 60L * 60L * 1000L));
+setSessionCookie(exchange, sessionToken, 86400);
+\end{lstlisting}
+
+Sessions are stored in the \texttt{api\_keys} table as
+\texttt{session\_token} and \texttt{session\_expires\_at}. A new login
+overwrites the previous session, providing single-concurrent-session
+semantics.
+
+\section{Lockout Policy}
+
+Five consecutive failed TOTP attempts triggers a 15-minute lockout
+(\texttt{locked\_until} column). Ten failures permanently revokes the key.
+Attempts are tracked per UUID in the \texttt{failed\_attempts} column.
+
+\section{Rate Limiting}
+
+The \texttt{RateLimiter} class uses a sliding-window algorithm:
+
+\begin{lstlisting}[language=Java, caption=Rate limiter core (RateLimiter.java)]
+public static boolean allow(String key, int maxRequests, long windowMs) {
+    long now = System.currentTimeMillis();
+    ArrayDeque<Long> log = logs.computeIfAbsent(key, k -> new ArrayDeque<>());
+    synchronized (log) {
+        while (!log.isEmpty() && log.peekFirst() < now - windowMs)
+            log.pollFirst();
+        if (log.size() >= maxRequests) return false;
+        log.addLast(now);
+        return true;
+    }
+}
+\end{lstlisting}
+
+Default configuration: 120 requests per 60-second window per IP/UUID.
+WebSocket clients are limited to 30 messages per 10 seconds.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\chapter{REST API}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\section{Server Details}
+
+The REST server is implemented by \texttt{EmbeddedServer.java} using
+JDK's built-in \texttt{com.sun.net.httpserver.HttpServer}. It listens on
+port 8080 by default (configurable in config.yml).
+
+\section{Authentication Endpoints}
+
+\begin{longtable}{>{\raggedright\arraybackslash}p{1.8cm}>{\raggedright\arraybackslash}p{6cm}>{\raggedright\arraybackslash}p{7cm}}
+\toprule
+\textbf{Method} & \textbf{Path} & \textbf{Description} \\
+\midrule
+\endhead
+POST & \apipath{/api/v1/auth/step1} & Submit API key; returns session token.
+  Body: \texttt{\{key: "mk\_..."\}}. \\
+POST & \apipath{/api/v1/auth/step2} & Submit TOTP code.
+  Body: \texttt{\{uuid, code\}}. Returns \texttt{session\_token} cookie. \\
+POST & \apipath{/api/v1/auth/logout} & Destroy current session. \\
+GET & \apipath{/api/v1/auth/status} & Check authentication status. \\
+\bottomrule
+\end{longtable}
+
+\section{Market Data Endpoints}
+
+\begin{longtable}{>{\raggedright\arraybackslash}p{1.8cm}>{\raggedright\arraybackslash}p{6cm}>{\raggedright\arraybackslash}p{7cm}}
+\toprule
+\textbf{Method} & \textbf{Path} & \textbf{Description} \\
+\midrule
+\endhead
+GET & \apipath{/api/v1/tickers} & All ticker snapshots sorted by absolute
+  price change. \\
+GET & \apipath{/api/v1/ticker/{ticker}} & Single ticker detail.
+  E.g.\ \apipath{/api/v1/ticker/DIAMOND}. \\
+GET & \apipath{/api/v1/orderbook/{ticker}/{depth}} & Bid/ask levels with
+  quantities and order counts. \\
+GET & \apipath{/api/v1/trades/{ticker}/{limit}} & Recent trade history. \\
+GET & \apipath{/api/v1/candles/{ticker}/{interval}/{limit}} & OHLCV
+  candle data. Intervals: 1m, 5m, 15m, 1h, 1d. \\
+\bottomrule
+\end{longtable}
+
+The \texttt{TickersHandler} (line~264) constructs a JSON array of all ticker
+snapshots:
+
+\begin{lstlisting}[language=Java, caption=Tickers response builder (EmbeddedServer.java:273-291)]
+List<TickerSnapshot> snapshots = StockMarketEngine.getAllTickers();
+List<Map<String, Object>> list = new ArrayList<>();
+for (TickerSnapshot s : snapshots) {
+    Map<String, Object> m = new LinkedHashMap<>();
+    m.put("ticker", s.ticker);
+    m.put("last_price", s.lastPrice);
+    m.put("bid", s.bidPrice);
+    m.put("ask", s.askPrice);
+    m.put("spread", s.spread);
+    m.put("change_24h_pct", Math.round(s.change24h * 100.0) / 100.0);
+    m.put("volume_24h", s.volume24h);
+    m.put("high_24h", s.high24h);
+    m.put("low_24h", s.low24h);
+    list.add(m);
+}
+\end{lstlisting}
+
+\section{Trading Endpoints}
+
+\begin{longtable}{>{\raggedright\arraybackslash}p{1.8cm}>{\raggedright\arraybackslash}p{6cm}>{\raggedright\arraybackslash}p{7cm}}
+\toprule
+\textbf{Method} & \textbf{Path} & \textbf{Description} \\
+\midrule
+\endhead
+GET & \apipath{/api/v1/orders} & List open orders for authenticated player. \\
+POST & \apipath{/api/v1/orders} & Place an order. Body:
+  \texttt{\{ticker, side, type, price?, quantity\}} \\
+DELETE & \apipath{/api/v1/order/{id}} & Cancel an open order. \\
+GET & \apipath{/api/v1/portfolio} & Portfolio holdings with P\&L. \\
+GET & \apipath{/api/v1/balance} & Player's Vault balance. \\
+\bottomrule
+\end{longtable}
+
+The \texttt{OrdersHandler} POST path (line~508) parses the request body and
+delegates to \texttt{StockMarketEngine.placeOrder()}:
+
+\begin{lstlisting}[language=Java, caption=Order placement (EmbeddedServer.java:508-543)]
+Map<String, String> body = parseForm(exchange);
+String ticker = body.get("ticker");
+String side = body.get("side");
+String type = body.get("type");
+String priceStr = body.get("price");
+String qtyStr = body.get("quantity");
+
+OrderType orderType = OrderType.valueOf(type.toUpperCase());
+OrderSide orderSide = OrderSide.valueOf(side.toUpperCase());
+double price = priceStr != null ? Double.parseDouble(priceStr) : 0;
+int quantity = Integer.parseInt(qtyStr);
+
+OrderResult result = StockMarketEngine.placeOrder(
+    uuid, ticker, orderType, orderSide, price, quantity);
+\end{lstlisting}
+
+\section{CORS and Error Handling}
+
+Every handler begins with \texttt{handleCors(exchange)} which adds
+\texttt{Access-Control-Allow-Origin: *} and handles OPTIONS preflight
+requests. Errors are returned as JSON with an \texttt{error} field and
+\texttt{success: false}.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\chapter{WebSocket Protocol}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\section{Server Details}
+
+\texttt{WebSocketManager.java} implements RFC~6455 on a separate port
+(default 8081). The implementation is self-contained---no external
+dependencies---using only JDK classes.
+
+\section{Connection}
+
+In development, the client connects directly:
+\begin{quote}
+\texttt{ws://localhost:8081}
+\end{quote}
+
+In production, the nginx reverse proxy forwards \texttt{/ws} on the same
+origin to port 8081, so the client connects via:
+\begin{quote}
+\texttt{wss://market.craftnepal.net/ws}
+\end{quote}
+
+The frontend determines the URL automatically using
+\texttt{location.protocol} and \texttt{location.host} in production builds.
+
+The server performs the standard WebSocket upgrade handshake:
+
+\begin{lstlisting}[language=Java, caption=WebSocket handshake (WebSocketManager.java)]
+MessageDigest sha1 = MessageDigest.getInstance("SHA-1");
+sha1.update(key.getBytes());
+sha1.update(MAGIC_GUID.getBytes());
+acceptKey = Base64.getEncoder().encodeToString(sha1.digest());
+
+String response = "HTTP/1.1 101 Switching Protocols\r\n" +
+    "Upgrade: websocket\r\n" +
+    "Connection: Upgrade\r\n" +
+    "Sec-WebSocket-Accept: " + acceptKey + "\r\n" +
+    "Access-Control-Allow-Origin: *\r\n" + "\r\n";
+out.write(response.getBytes());
+\end{lstlisting}
+
+\section{Subscription Protocol}
+
+After connecting, the client sends JSON messages to subscribe to channels:
+
+\begin{lstlisting}[language=TeX, caption=Client subscribe message]
+{"type":"subscribe","channel":"tickers"}
+{"type":"subscribe","channel":"trades.DIAMOND"}
+{"type":"subscribe","channel":"orderbook.DIAMOND"}
+\end{lstlisting}
+
+Unsubscribe follows the same pattern:
+
+\begin{lstlisting}[language=TeX, caption=Client unsubscribe message]
+{"type":"unsubscribe","channel":"trades.DIAMOND"}
+\end{lstlisting}
+
+\section{Broadcast Channels}
+
+\begin{longtable}{>{\raggedright\arraybackslash}p{3.5cm}>{\raggedright\arraybackslash}p{7cm}>{\raggedright\arraybackslash}p{4cm}}
+\toprule
+\textbf{Channel} & \textbf{Content} & \textbf{Frequency} \\
+\midrule
+\endhead
+\texttt{tickers} & All ticker snapshots (price, change, volume, high/low) & Every 5 seconds \\
+\texttt{trades} & All executed trades (id, ticker, price, qty, timestamp) & On every match \\
+\texttt{trades.\{TICKER\}} & Per-ticker trade feed & On every match \\
+\texttt{orderbooks} & All order book depth (top 10 levels) & On every trade \\
+\texttt{orderbook.\{TICKER\}} & Per-ticker depth & On every trade \\
+\bottomrule
+\end{longtable}
+
+\section{Message Formats}
+
+Ticker broadcast:
+
+\begin{lstlisting}[language=TeX, caption=WebSocket ticker message]
+{
+  "type": "tickers",
+  "data": [
+    {"ticker":"DIAMOND","last_price":150.25,"bid":149.00,
+     "ask":151.50,"change_24h_pct":2.34,"volume_24h":1200,
+     "high_24h":155.00,"low_24h":145.50}
+  ]
+}
+\end{lstlisting}
+
+Trade broadcast:
+
+\begin{lstlisting}[language=TeX, caption=WebSocket trade message]
+{
+  "type": "trade",
+  "data": {
+    "id": "trd_a1b2c3d4e5f6",
+    "ticker": "DIAMOND",
+    "price": 150.25,
+    "quantity": 10,
+    "buyer_uuid": "00000000-0000-0000-0000-000000000000",
+    "seller_uuid": "00000000-0000-0000-0000-000000000000",
+    "timestamp": 1700000000000
+  }
+}
+\end{lstlisting}
+
+Order book broadcast:
+
+\begin{lstlisting}[language=TeX, caption=WebSocket order book message]
+{
+  "type": "orderbook",
+  "ticker": "DIAMOND",
+  "data": {
+    "bids": [{"price":150.00,"quantity":50,"orders":3}],
+    "asks": [{"price":151.00,"quantity":30,"orders":2}]
+  }
+}
+\end{lstlisting}
+
+\section{Keepalive}
+
+The server sends a WebSocket ping frame to every connected client every
+30 seconds. Clients should respond with a pong. Dead connections are
+cleaned up automatically.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\chapter{OHLCV Aggregation Engine}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\section{Purpose}
+
+The \texttt{CandleAggregator} class converts raw trade data into
+standardized candlestick data for charting. It runs every 60 seconds via
+the Bukkit scheduler.
+
+\section{Intervals}
+
+Five interval granularities are supported:
+
+\begin{tabular}{>{\raggedright\arraybackslash}p{2cm}>{\raggedright\arraybackslash}p{4cm}>{\raggedright\arraybackslash}p{8cm}}
+\toprule
+\textbf{Interval} & \textbf{Period} & \textbf{Retention} \\
+\midrule
+1m & 60 seconds & 24 hours \\
+5m & 5 minutes & 7 days \\
+15m & 15 minutes & 30 days \\
+1h & 1 hour & 90 days \\
+1d & 1 day & Forever \\
+\bottomrule
+\end{tabular}
+
+\section{Aggregation Algorithm}
+
+For each interval, the aggregator queries trades since the last candle's
+close time, groups them by time bucket (\texttt{timestamp - (timestamp \% intervalMs)}),
+and computes OHLCV for each bucket:
+
+\begin{lstlisting}[language=Java, caption=Candle building (CandleAggregator.java)]
+static class CandleBuilder {
+    double open, high, low, close;
+    int volume, tradeCount;
+    boolean initialized;
+
+    void add(double price, int qty) {
+        if (!initialized) {
+            open = high = low = close = price;
+            initialized = true;
+        } else {
+            if (price > high) high = price;
+            if (price < low) low = price;
+            close = price;
+        }
+        volume += qty;
+        tradeCount++;
+    }
+}
+\end{lstlisting}
+
+Candles are upserted into the \texttt{stock\_candles} table using
+\texttt{INSERT OR REPLACE} with a composite primary key of
+\texttt{(ticker, interval, open\_time)}.
+
+\section{Query}
+
+The \texttt{CandlesHandler} REST endpoint at
+\texttt{GET /api/v1/candles/\{ticker\}/\{interval\}/\{limit\}} returns sorted
+candle data for the chart:
+
+\begin{lstlisting}[language=Java, caption=Candle query (CandleAggregator.java)]
+public static List<Candle> getCandles(String ticker, String interval, int limit) {
+    String sql = "SELECT * FROM stock_candles WHERE ticker = ? AND interval = ? " +
+                 "ORDER BY open_time DESC LIMIT ?";
+    // ... execute, reverse into ascending order ...
+}
+\end{lstlisting}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\chapter{Admin Commands}
+% ══════════════════════════════════════════════════════════════════════════════
+
+All stock market admin commands require the \texttt{market.admin} permission
+and are accessed under: \texttt{/market admin stock <subcommand>}.
+
+\section{Pause}
+
+Pauses the stock market engine. All order matching and stop-order evaluation
+stops immediately. New orders return an error with message
+``Stock market is currently paused by an admin.''
+
+\begin{lstlisting}[language=sh, caption=Usage]
+/market admin stock pause [reason]
+\end{lstlisting}
+
+Implementation (\texttt{StockMarketEngine.java}):
+
+\begin{lstlisting}[language=Java, caption=Pause implementation]
+public static void pause() {
+    paused = true;
+    Bukkit.getLogger().warning("[Market] Stock market PAUSED.");
+}
+\end{lstlisting}
+
+\section{Resume}
+
+Resumes the stock market engine after a pause. Matching and stop-order
+evaluation resume on the next tick cycle.
+
+\begin{lstlisting}[language=sh, caption=Usage]
+/market admin stock resume
+\end{lstlisting}
+
+\begin{lstlisting}[language=Java, caption=Resume implementation]
+public static void resume() {
+    paused = false;
+    Bukkit.getLogger().info("[Market] Stock market RESUMED.");
+}
+\end{lstlisting}
+
+\section{Inject Test Trade}
+
+Injects a fake trade directly into the system without going through the
+order book. This sets the last price for the ticker and creates a trade
+record, which is broadcast to WebSocket subscribers. Useful for testing
+the full pipeline (database, REST API, WebSocket, frontend chart) without
+player interaction.
+
+\begin{lstlisting}[language=sh, caption=Usage]
+/market admin stock inject <ticker> <price> <quantity>
+\end{lstlisting}
+
+Example:
+\begin{lstlisting}[language=sh, caption=Example]
+/market admin stock inject DIAMOND 150.25 10
+\end{lstlisting}
+
+Implementation (\texttt{StockMarketEngine.java}):
+\begin{lstlisting}[language=Java, caption=Inject trade implementation]
+public static Trade injectTrade(String ticker, double price, int quantity) {
+    if (!loaded) return null;
+    ticker = ticker.toUpperCase();
+    lastPrices.put(ticker, price);
+    Trade trade = new Trade(
+        generateId("trd_"), ticker, price, quantity,
+        "00000000-0000-0000-0000-000000000000",
+        "00000000-0000-0000-0000-000000000000",
+        "injected", "injected", System.currentTimeMillis()
+    );
+    saveTrade(trade);
+    broadcastTrades(List.of(trade));
+    return trade;
+}
+\end{lstlisting}
+
+\section{Status}
+
+Displays current stock market engine status including pause state, open order
+count, and 24-hour trade count.
+
+\begin{lstlisting}[language=sh, caption=Usage]
+/market admin stock status
+\end{lstlisting}
+
+Sample output:
+\begin{lstlisting}[language=sh, caption=Sample status output]
+--- Stock Market Status ---
+Engine: RUNNING
+Open orders: 12
+Trades (24h): 45
+\end{lstlisting}
+
+\section{Complete Subcommand Registration}
+
+The \texttt{StockCommand} nested command (\texttt{StockCommand.java})
+registers all four subcommands:
+
+\begin{lstlisting}[language=Java, caption=StockCommand registration]
+public class StockCommand extends NestedCommand {
+    public StockCommand() {
+        registerSubCommand(new Pause());
+        registerSubCommand(new Resume());
+        registerSubCommand(new Inject());
+        registerSubCommand(new Status());
+    }
+    @Override
+    public String getRequiredPermission() { return "market.admin"; }
+    @Override
+    public String getName() { return "stock"; }
+}
+\end{lstlisting}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\chapter{Frontend Application}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\section{Technology Stack}
+
+\begin{description}
+\item[Build] Vite 6 + TypeScript 5
+\item[UI] React 18, React Router 6
+\item[Charting] TradingView Lightweight Charts 4
+\item[Styling] Tailwind CSS 3 (Catppuccin dark theme)
+\end{description}
+
+\section{Project Structure}
+
+\begin{verbatim}
+stock-website/
++-- src/
+    +-- api/
+    |   +-- client.ts       # fetch wrapper with cookie auth (credentials:include)
+    |   +-- auth.ts         # step1, step2, status, logout
+    |   +-- market.ts       # tickers, orderbook, trades, orders, portfolio
+    |   +-- websocket.ts    # WsClient with auto-reconnect + key transform
+    |   +-- transform.ts    # snake_case to camelCase normalizer
+    +-- store/
+    |   +-- auth.tsx        # AuthContext + AuthProvider
+    +-- pages/
+    |   +-- Login.tsx       # API key entry
+    |   +-- Verify2FA.tsx   # TOTP code entry
+    |   +-- Dashboard.tsx   # Main trading interface
+    |   +-- Portfolio.tsx   # Holdings with P&L
+    +-- components/
+    |   +-- Layout.tsx      # Header + router outlet
+    |   +-- Header.tsx      # Navigation + logout
+    |   +-- TickerList.tsx  # Searchable ticker sidebar
+    |   +-- Chart.tsx       # Candlestick chart with interval selector
+    |   +-- OrderBook.tsx   # Bid/ask levels with depth bars
+    |   +-- TradeHistory.tsx# Recent trades feed
+    |   +-- OrderForm.tsx   # Buy/Sell with Market/Limit/Stop types
+    |   +-- OrderList.tsx   # Open orders table with cancel
+    +-- types/index.ts      # All TypeScript interfaces
+\end{verbatim}
+
+\section{Key Components}
+
+\subsection{WebSocket Client (\texttt{api/websocket.ts})}
+
+The \texttt{WsClient} class provides automatic reconnection with a 5-second
+backoff, typed event handling, and subscribe/unsubscribe:
+
+\begin{lstlisting}[language=Java, caption=WebSocket client class]
+export class WsClient {
+  private ws: WebSocket | null = null;
+  private handlers = new Map<string, Set<WsMessageHandler>>();
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+  subscribe(channel: string) {
+    this.send({ type: 'subscribe', channel });
+  }
+
+  on(type: string, handler: WsMessageHandler) {
+    if (!this.handlers.has(type)) this.handlers.set(type, new Set());
+    this.handlers.get(type)!.add(handler);
+    return () => this.handlers.get(type)?.delete(handler);
+  }
+}
+\end{lstlisting}
+
+\subsection{Dashboard Layout}
+
+The Dashboard (\texttt{pages/Dashboard.tsx}) renders a multi-panel layout:
+
+\begin{verbatim}
++--------------------------------------------------------------+
+| Header:  CN Market | Trade | Portfolio  | Player | Logout    |
++----------+------------------------------+--------------------+
+| Ticker   |     Candlestick Chart        |   Order Book       |
+| List     |     (Lightweight Charts)     |   (bids / asks)    |
+| (sorted  |     + interval selector     +--------------------+
+|  by |%|) |                              |   Trade History    |
++----------+------------------------------+--------------------+
+|  Order Form (Buy/Sell, Market/Limit/Stop Loss/Take Profit)   |
++--------------------------------------------------------------+
+|  Open Orders table (ticker, side, type, price, qty, cancel)  |
++--------------------------------------------------------------+
+\end{verbatim}
+
+\subsection{Candlestick Chart (\texttt{components/Chart.tsx})}
+
+The chart uses TradingView's Lightweight Charts library. It fetches data
+from \texttt{GET /api/v1/candles/\{ticker\}/\{interval\}/200} and renders a
+candlestick series. An interval selector lets the user switch between
+1m, 5m, 15m, 1h, and 1d granularities.
+
+\subsection{Order Form (\texttt{components/OrderForm.tsx})}
+
+Supports all four order types with validation:
+\begin{itemize}
+\item Buy/Sell toggle button group
+\item Market, Limit, Stop Loss, Take Profit selector
+\item Conditional price input (required for Limit/Stop/Take Profit)
+\item Quantity input with minimum validation
+\item Real-time reference price display
+\end{itemize}
+
+\section{Auth Flow}
+
+The React app uses \texttt{AuthContext} (stored in React state with
+sessionStorage persistence). The protected route wrapper
+(\texttt{ProtectedRoute}) redirects unauthenticated users to the login page:
+
+\begin{lstlisting}[language=Java, caption=Protected route logic]
+function ProtectedRoute({ children }: { children: React.ReactNode }) {
+  const { sessionId, loading } = useAuth();
+  if (loading) return <Loading />;
+  if (!sessionId) return <Navigate to="/login" replace />;
+  return <>{children}</>;
+}
+\end{lstlisting}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\chapter{Configuration}
+% ══════════════════════════════════════════════════════════════════════════════
+
+All stock market configuration lives in \texttt{plugins/Market/config.yml}
+under the \texttt{stock-api} key:
+
+\begin{lstlisting}[language=sh, caption=config.yml stock-api section]
+# Stock Market API -- embedded HTTP server + WebSocket
+stock-api:
+  # Enable the embedded servers for stock market website integration
+  enabled: true
+  # Port the HTTP REST API server listens on
+  port: 8080
+  # Port the WebSocket real-time server listens on
+  ws-port: 8081
+  # Rate-limiting: max requests per window for REST API
+  rate-limit:
+    max-requests: 120
+    window-seconds: 60
+\end{lstlisting}
+
+\section{Port Configuration}
+
+\begin{description}
+\item[port (default 8080)] The REST API server. The Vite dev server proxies
+  \texttt{/api/*} to this port.
+\item[ws-port (default 8081)] The WebSocket server. The frontend connects
+  directly to \texttt{ws://hostname:8081}.
+\end{description}
+
+\section{Rate Limiting}
+
+\begin{description}
+\item[max-requests (default 120)] Maximum number of REST API requests allowed
+  within the window. Public endpoints are keyed by IP; authenticated endpoints
+  are keyed by session UUID.
+\item[window-seconds (default 60)] The sliding window duration in seconds.
+\end{description}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\chapter{Building and Deployment}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\section{Prerequisites}
+
+\begin{itemize}
+\item Java 21 JDK (for the Spigot plugin)
+\item Maven 3.8+ (for building the plugin)
+\item Node.js 20+ and npm (for the frontend)
+\item A Spigot/Paper 1.21.x Minecraft server
+\end{itemize}
+
+\section{Building the Plugin}
+
+\begin{lstlisting}[language=sh, caption=Build plugin]
+cd CN-Market-main
+mvn clean package
+\end{lstlisting}
+
+The output JAR (\texttt{target/Market.jar}) is a shaded plugin containing
+all dependencies.
+
+\section{Running the Frontend}
+
+\begin{lstlisting}[language=sh, caption=Start frontend dev server]
+cd stock-website
+npm install
+npm run dev
+\end{lstlisting}
+
+The Vite dev server runs on port 3000 and proxies \texttt{/api/*} to
+\texttt{localhost:8080} and \texttt{/ws} to \texttt{ws://localhost:8081}.
+
+\section{Production Build}
+
+\begin{lstlisting}[language=sh, caption=Production frontend build]
+cd stock-website
+npm run build
+\end{lstlisting}
+
+The output is in \texttt{stock-website/dist/} and can be served by any
+static file server.
+
+\section{Production Deployment (nginx)}
+
+A reverse proxy is required in production so that the REST API
+(\textasciitilde:8080), WebSocket (\textasciitilde:8081), and static frontend
+are all served on the same origin. A reference config is provided in
+\texttt{nginx-market.conf}:
+
+\begin{lstlisting}[language=sh, caption=Deploy with nginx]
+# 1. Build the plugin JAR and frontend dist
+mvn clean package
+cd stock-website && npm run build && cd ..
+
+# 2. Copy artifacts to server
+cp target/Market.jar /srv/minecraft/plugins/
+cp -r stock-website/dist/* /var/www/market/
+
+# 3. Install nginx config
+sudo cp nginx-market.conf /etc/nginx/sites-available/market
+sudo ln -s /etc/nginx/sites-available/market /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+\end{lstlisting}
+
+The nginx config handles:
+\begin{itemize}
+\item Static file serving from \texttt{/var/www/market} (with long-lived cache
+  headers for \texttt{/assets/})
+\item Reverse proxy for \texttt{/api/*} to \texttt{localhost:8080}
+\item WebSocket upgrade for \texttt{/ws} to \texttt{localhost:8081}
+\item SPA fallback (all routes serve \texttt{index.html})
+\item Gzip compression and security headers
+\end{itemize}
+
+\section{Docker Test Server}
+
+A \texttt{docker-compose.yml} is provided for local integration testing:
+
+\begin{lstlisting}[language=sh, caption=Start Docker test server]
+# Build the plugin first
+mvn clean package
+
+# Start PaperMC server with plugin mounted
+docker compose up -d
+
+# Watch server logs
+docker compose logs -f mc-server
+\end{lstlisting}
+
+The Docker setup uses \texttt{itzg/minecraft-server} with Paper 1.21.x
+(version 26.1.2) and mounts \texttt{target/Market.jar} into the plugins
+directory.
+
+\section{Testing with Injected Trades}
+
+\begin{enumerate}
+\item Start the Minecraft server with the plugin.
+\item Generate an API key: \texttt{/market apikey generate}.
+\item Inject test data: \texttt{/market admin stock inject DIAMOND 150.25 10}.
+\item Open \texttt{http://localhost:3000}, paste the key, complete TOTP setup.
+\item View the dashboard with injected trade data visible on the chart.
+\end{enumerate}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\chapter{Complete Source Listings}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\section{Key File Reference}
+
+\begin{longtable}{ll}
+\toprule
+\textbf{File} & \textbf{Lines} \\
+\midrule
+\endhead
+\texttt{stock/StockMarketEngine.java} & 1019 \\
+\texttt{stock/EmbeddedServer.java} & 798 \\
+\texttt{stock/WebSocketManager.java} & 434 \\
+\texttt{stock/ApiKeyManager.java} & 328 \\
+\texttt{stock/TwoFactorAuth.java} & 180 \\
+\texttt{stock/CandleAggregator.java} & 195 \\
+\texttt{stock/RateLimiter.java} & 65 \\
+\texttt{stock/transform.ts (frontend)} & 15 \\
+\texttt{subcommands/StockCommand.java} & 38 \\
+\texttt{subcommands/stock/Pause.java} & 56 \\
+\texttt{subcommands/stock/Resume.java} & 51 \\
+\texttt{subcommands/stock/Inject.java} & 88 \\
+\texttt{subcommands/stock/Status.java} & 78 \\
+\texttt{subcommands/ApiKeyCommand.java} & 42 \\
+\texttt{subcommands/apikey/Generate.java} & 60 \\
+\texttt{subcommands/apikey/Renew.java} & 48 \\
+\texttt{subcommands/apikey/Revoke.java} & 48 \\
+\texttt{subcommands/apikey/Status.java} & 58 \\
+\texttt{managers/DatabaseManager.java} & 957 \\
+\texttt{Market.java} & 182 \\
+\texttt{nginx-market.conf} & 52 \\
+\bottomrule
+\end{longtable}
+
+\section{Total Size}
+
+\begin{itemize}
+\item Java source (stock package): \textasciitilde3,250 lines
+\item Java source (all stock-related): \textasciitilde4,600 lines
+\item TypeScript/React source: \textasciitilde1,200 lines
+\item Total: \textasciitilde5,800 lines of new code
+\end{itemize}
+
+\end{document}
