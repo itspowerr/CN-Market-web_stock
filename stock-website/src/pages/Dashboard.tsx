@@ -92,11 +92,11 @@ export default function Dashboard() {
         </div>
 
         {/* Right panel */}
-        <div className="w-64 shrink-0 flex flex-col gap-4">
-          <div className="flex-1">
+        <div className="w-64 shrink-0 flex flex-col gap-4 min-h-0">
+          <div className="flex-1 min-h-0">
             <OrderBook ticker={selectedTicker} />
           </div>
-          <div className="flex-1">
+          <div className="flex-1 min-h-0">
             <TradeHistory ticker={selectedTicker} />
           </div>
         </div>
@@ -111,7 +111,7 @@ export default function Dashboard() {
             onPlaced={handleOrderPlaced}
           />
         </div>
-        <div className="flex-1">
+        <div className="flex-1 min-w-0">
           <OrderList />
         </div>
       </div>

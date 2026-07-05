@@ -1,17 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
-import { createChart, ColorType, IChartApi } from 'lightweight-charts'
+import { createChart, ColorType, IChartApi, ISeriesApi } from 'lightweight-charts'
 import { fetchCandles } from '../api/market'
+import { wsClient } from '../api/websocket'
 
 interface Props {
   ticker: string
-}
-
-interface Candle {
-  time: string
-  open: number
-  high: number
-  low: number
-  close: number
 }
 
 const INTERVALS = ['1h', '15m', '5m', '1m', '1d'] as const
@@ -20,7 +13,8 @@ type Interval = (typeof INTERVALS)[number]
 export default function Chart({ ticker }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
-  const [interval, setInterval] = useState<Interval>('1h')
+  const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
+  const [selectedInterval, setSelectedInterval] = useState<Interval>('1h')
 
   useEffect(() => {
     if (!containerRef.current) return
@@ -40,7 +34,7 @@ export default function Chart({ ticker }: Props) {
         horzLine: { color: '#6b7280', style: 2 },
       },
       rightPriceScale: { borderColor: '#1e1e2e' },
-      timeScale: { borderColor: '#1e1e2e', timeVisible: false },
+      timeScale: { borderColor: '#1e1e2e', timeVisible: true, secondsVisible: false },
       width: containerRef.current.clientWidth,
       height: containerRef.current.clientHeight,
     })
@@ -55,23 +49,24 @@ export default function Chart({ ticker }: Props) {
     } as const)
 
     chartRef.current = chart
+    seriesRef.current = series
 
     const load = async () => {
       try {
-        const data = await fetchCandles(ticker, interval, 200)
-        const candles: Candle[] = (data.candles || []).map((c) => {
+        const data = await fetchCandles(ticker, selectedInterval, 200)
+        const candles = (data.candles || []).map((c) => {
           const t = new Date(c.openTime)
-          const time = interval === '1d'
+          const time = selectedInterval === '1d'
             ? `${t.getUTCFullYear()}-${String(t.getUTCMonth() + 1).padStart(2, '0')}-${String(t.getUTCDate()).padStart(2, '0')}`
-            : Math.floor(t.getTime() / 1000).toString()
+            : Math.floor(t.getTime() / 1000)
           return { time, open: c.open, high: c.high, low: c.low, close: c.close }
         })
         if (candles.length > 0) series.setData(candles)
-      } catch {
-        // ignore
-      }
+      } catch { /* */ }
     }
     load()
+
+    const timerId = window.setInterval(load, 15000)
 
     const handleResize = () => {
       if (containerRef.current) {
@@ -84,10 +79,34 @@ export default function Chart({ ticker }: Props) {
     window.addEventListener('resize', handleResize)
 
     return () => {
+      window.clearInterval(timerId)
       window.removeEventListener('resize', handleResize)
       chart.remove()
+      seriesRef.current = null
     }
-  }, [ticker, interval])
+  }, [ticker, selectedInterval])
+
+  useEffect(() => {
+    const unsub = wsClient.on('tickers', (msg) => {
+      const list = (msg.data as Record<string, unknown>[]) || []
+      const found = list.find((t) => t.ticker === ticker)
+      if (!found || !seriesRef.current) return
+
+      const s = seriesRef.current
+      const candles = s.data()
+      const last = candles[candles.length - 1]
+      if (!last) return
+
+      const price = found.lastPrice as number
+      s.update({
+        time: last.time,
+        close: price,
+        high: Math.max(last.high as number, price),
+        low: Math.min(last.low as number, price),
+      } as never)
+    })
+    return () => unsub()
+  }, [ticker])
 
   return (
     <div className="flex flex-col h-full">
@@ -95,9 +114,9 @@ export default function Chart({ ticker }: Props) {
         {INTERVALS.map((iv) => (
           <button
             key={iv}
-            onClick={() => setInterval(iv)}
+            onClick={() => setSelectedInterval(iv)}
             className={`px-2.5 py-1 text-xs rounded transition-colors ${
-              interval === iv
+              selectedInterval === iv
                 ? 'bg-accent-blue/20 text-accent-blue'
                 : 'text-gray-500 hover:text-gray-300'
             }`}

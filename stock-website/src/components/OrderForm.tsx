@@ -15,11 +15,13 @@ export default function OrderForm({ ticker, lastPrice, onPlaced }: Props) {
   const [stopPrice, setStopPrice] = useState('')
   const [quantity, setQuantity] = useState('1')
   const [error, setError] = useState('')
+  const [success, setSuccess] = useState('')
   const [loading, setLoading] = useState(false)
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     setError('')
+    setSuccess('')
     const qty = parseInt(quantity)
     if (isNaN(qty) || qty <= 0) {
       setError('Invalid quantity')
@@ -38,9 +40,11 @@ export default function OrderForm({ ticker, lastPrice, onPlaced }: Props) {
       if (!result.success) {
         setError(result.error || 'Order failed')
       } else {
+        setSuccess(`${side === 'BUY' ? 'Bought' : 'Sold'} ${qty} ${ticker}`)
         setQuantity('1')
         setPrice('')
         setStopPrice('')
+        setTimeout(() => setSuccess(''), 3000)
         onPlaced()
       }
     } catch (err: unknown) {
@@ -53,6 +57,12 @@ export default function OrderForm({ ticker, lastPrice, onPlaced }: Props) {
   return (
     <div className="bg-surface-200 rounded-xl p-4">
       <h3 className="text-sm font-medium text-gray-400 mb-3">Place Order</h3>
+
+      {success && (
+        <div className="bg-accent-green/10 border border-accent-green/30 text-accent-green px-3 py-2 rounded-lg mb-3 text-xs font-medium">
+          {success}
+        </div>
+      )}
 
       {error && (
         <div className="bg-red-500/10 border border-red-500/30 text-red-400 px-3 py-2 rounded-lg mb-3 text-xs">

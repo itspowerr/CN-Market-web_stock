@@ -1,5 +1,5 @@
 export function toCamelCase(str: string): string {
-  return str.replace(/_([a-z])/g, (_, c) => c.toUpperCase())
+  return str.replace(/_(\w)/g, (_, c) => c.toUpperCase())
 }
 
 export function transformKeys(obj: unknown): unknown {
